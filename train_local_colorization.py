@@ -7,7 +7,7 @@ from torch.optim import Adam
 from tqdm import tqdm
 
 from class_ColorizationNet import ColorizationNet
-from build_loader_local import build_local_loader
+from build_loader_local import build_train_val_loaders
 
 
 def find_latest_checkpoint(checkpoint_dir):
@@ -53,17 +53,21 @@ def train_local(
 ):
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    loader = build_local_loader(
+    train_loader, val_loader = build_train_val_loaders(
         root_dir=image_root,
         batch_size=batch_size,
         image_size=image_size,
         num_workers=4,
-        shuffle=True,
+        val_fraction=0.1,
     )
 
     model = ColorizationNet().to(device)
     criterion = nn.L1Loss()
     optimizer = Adam(model.parameters(), lr=lr)
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer, mode="min", patience=3, factor=0.5, verbose=True
+                    )  # optional: reduce LR if val loss plateaus
 
     # Try to resume from latest checkpoint
     latest_ckpt, global_step, start_epoch = find_latest_checkpoint(checkpoint_dir)
@@ -78,12 +82,13 @@ def train_local(
         global_step = 0
         start_epoch = 0
 
-    # Track best loss seen so far (for "best" checkpoint)
-    best_loss = float("inf")
+    # Track best validation loss for "best" checkpoint saving
+    best_val_loss = float("inf")
 
     for epoch in range(start_epoch, num_epochs):
-        print(f"Starting epoch {epoch+1}/{num_epochs} (global_step={global_step})...")
-        epoch_bar = tqdm(loader, desc=f"Epoch {epoch+1}", unit="batch")
+        # ----- TRAIN -----
+        model.train()
+        epoch_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}", unit="batch")
 
         for L_batch, ab_batch in epoch_bar:
             L_batch = L_batch.to(device).float()
@@ -93,6 +98,9 @@ def train_local(
             ab_pred = model(L_batch)
             loss = criterion(ab_pred, ab_batch)
             loss.backward()
+
+            # GRADIENT CLIPPING: clip gradients to max norm of 1.0 to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) 
             optimizer.step()
 
             global_step += 1
@@ -113,16 +121,40 @@ def train_local(
                 torch.save(state, ckpt_path)
                 print(f"\nSaved checkpoint to {ckpt_path}")
 
-                # "Best" checkpoint (based on lowest loss so far)
-                if loss_value < best_loss:
-                    best_loss = loss_value
-                    best_path = os.path.join(
-                        checkpoint_dir, "Landscape Dataset 90K_best.pt"
-                    )
-                    torch.save(state, best_path)
-                    print(
-                        f"New best checkpoint (loss={best_loss:.4f}) saved to {best_path}"
-                    )
+        # ----- VALIDATION -----
+        model.eval() # inference mode (no dropout/batchnorm updates)
+        val_loss_sum = 0.0
+        val_count = 0
+        with torch.no_grad():
+            for L_val, ab_val in val_loader:
+                L_val = L_val.to(device).float()
+                ab_val = ab_val.to(device).float()
+                ab_pred_val = model(L_val)
+                loss_val = criterion(ab_pred_val, ab_val)
+                val_loss_sum += loss_val.item() * L_val.size(0)
+                val_count += L_val.size(0)
+
+        mean_val_loss = val_loss_sum / max(1, val_count)
+        print(f"Epoch {epoch+1}: val_loss = {mean_val_loss:.4f}")
+
+        # LR SCHEDULER: step the ReduceLROnPlateau scheduler with the mean validation loss
+        scheduler.step(mean_val_loss)
+
+        # after computing mean_val_loss:
+        if mean_val_loss < best_val_loss:
+            best_val_loss = mean_val_loss
+            best_path = os.path.join(checkpoint_dir, "Landscape Dataset 90K_best.pt")
+            torch.save(
+                {
+                    "step": global_step,
+                    "epoch": epoch,
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "val_loss": mean_val_loss,
+                },
+                best_path,
+            )
+            print(f"New best checkpoint (val_loss={best_val_loss:.4f}) saved to {best_path}")
 
 
 if __name__ == "__main__":
@@ -139,3 +171,9 @@ if __name__ == "__main__":
         checkpoint_dir="checkpoints_local",
         save_every_steps=1_000,
     )
+
+
+# check size of batches 
+    # landscape dataset
+        #train_loader = (90000 x 0.9) / 32 = 2531 batches per epoch
+                        # 90000 / 32 = 2812 batches per epoch if no val split 
