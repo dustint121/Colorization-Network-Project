@@ -22,12 +22,17 @@ class ColorizationNet(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # Load a pretrained ResNet-18 (ImageNet weights)[web:48]
-        resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        # # Load a pretrained ResNet-18 (ImageNet weights)[web:48]
+        # resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
 
-        # Take only the convolutional "feature extractor" part (remove avgpool + fc)
-        # children() returns the layers in order;[:-2] keeps everything up to the last conv block
+        # # Take only the convolutional "feature extractor" part (remove avgpool + fc)
+        # # children() returns the layers in order;[:-2] keeps everything up to the last conv block
+        # self.encoder = nn.Sequential(*list(resnet.children())[:-2])
+
+        resnet = models.resnet18(weights="IMAGENET1K_V1")
         self.encoder = nn.Sequential(*list(resnet.children())[:-2])
+
+        
 
         # Decoder: upsample feature maps back to original size and output 2 channels (A and B)
         # This is a very simple decoder; you can make it deeper for better quality.
