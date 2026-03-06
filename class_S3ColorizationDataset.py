@@ -65,6 +65,7 @@ class S3ColorizationDataset(IterableDataset):
                 prefix_or_uris,
                 region=self.region,
                 endpoint=self.endpoint,
+                enable_sharding=True  # Enable sharding for distributed training
             )
             self.num_files = len(self._list_s3_keys())
         else:
@@ -72,6 +73,7 @@ class S3ColorizationDataset(IterableDataset):
                 prefix_or_uris,
                 region=self.region,
                 endpoint=self.endpoint,
+                enable_sharding=True  # Enable sharding for distributed training
             )
             self.num_files = len(prefix_or_uris)
         # print(f"Size={len(self.dataset)}")
@@ -116,7 +118,7 @@ class S3ColorizationDataset(IterableDataset):
                 key = obj["Key"]
                 if key.lower().endswith((".jpg", ".jpeg", ".png")):
                     keys.append(key)
-        print(f"\tTotal image keys found: {len(keys)}")
+        # print(f"\tTotal image keys found: {len(keys)}")
         return keys
 
     def _reader_to_sample(self, reader_or_key):
@@ -169,10 +171,6 @@ class S3ColorizationDataset(IterableDataset):
 
     def __len__(self):
         if self.use_s3torchconnector:
-            # if type(self.dataset) == s3tc.S3IterableDataset: # s3torchconnector dataset has no __len__, so we track keys separately
-            #     return 0
-            # return len(self.dataset)
-            # return len(self.dataset)
             return self.num_files
         else:
             return len(self.keys)

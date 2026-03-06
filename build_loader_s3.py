@@ -1,6 +1,5 @@
 # build_loader_s3.py
 from torch.utils.data import DataLoader, IterableDataset
-
 from class_S3ColorizationDataset import S3ColorizationDataset
 
 import random
@@ -61,8 +60,8 @@ def build_train_val_s3_loaders(
 
         all_keys = [f"{s3_prefix}{key}" for key in all_keys]  # Prepend prefix to keys
         random.shuffle(all_keys)  # Shuffle keys to randomize train/val split
-        # Split into two lists (90% and 10%)
-        split_point = int(len(all_keys) * 0.9)
+        # Split into two lists based on val_fraction (default 0.1 means 10% val, 90% train)
+        split_point = int(len(all_keys) * (1 - val_fraction))
         train_set_uris = all_keys[:split_point]
         val_set_uris = all_keys[split_point:]
 
@@ -85,8 +84,6 @@ def build_train_val_s3_loaders(
 
         print(f"Train/Val split: {len(train_set_uris)} train images, {len(val_set_uris)} val images.")
         print(f"Train dataset length: {len(train_dataset)}, Val dataset length: {len(val_dataset)}")
-        # print(train_dataset.keys[:5])  # Print first 5 train keys for verification
-        # print(val_dataset.keys[:5])  # Print first 5 val keys for verification
 
     pin_memory = True if num_workers > 0 else False
 
@@ -95,6 +92,7 @@ def build_train_val_s3_loaders(
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        # persistent_workers=num_workers > 0,  # Keep workers alive across epochs for IterableDataset        
     )
     print(f"Built train loader with {len(train_loader)} batches.")
     val_loader = DataLoader(
@@ -102,6 +100,7 @@ def build_train_val_s3_loaders(
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        # persistent_workers=num_workers > 0,  # Keep workers alive across epochs for IterableDataset
     )
     print(f"Built val loader with {len(val_loader)} batches.")
     return train_loader, val_loader
