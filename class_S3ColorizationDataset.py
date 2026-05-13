@@ -4,9 +4,9 @@ import os
 import torch
 from torch.utils.data import IterableDataset
 from torchvision import transforms
-from PIL import Image
-import numpy as np
-from skimage.color import rgb2lab
+import torch.nn.functional as F
+from torchvision.io import decode_image
+from kornia.color import rgb_to_lab
 
 import dotenv
 dotenv.load_dotenv()
@@ -28,6 +28,12 @@ AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 class S3ColorizationDataset(IterableDataset):
     """
     Iterable dataset for S3. Falls back to boto3 if s3torchconnector unavailable (Windows).
+
+    NOTE: All preprocessing is CPU-only. DataLoader workers are forked subprocesses,
+    and CUDA does not survive fork() reliably — touching CUDA inside a worker
+    silently corrupts samples (or raises async errors that get swallowed by the
+    try/except in __iter__). We move tensors to GPU in the training loop instead,
+    via L_batch.to(device) / ab_batch.to(device).
     """
     def __init__(
         self,
@@ -101,9 +107,6 @@ class S3ColorizationDataset(IterableDataset):
 
     def _list_s3_keys(self):
         """List all image files under S3 prefix."""
-        # print("Listing S3 keys using boto3...")
-        # print(f"\tBucket: {self.bucket}")
-        # print(f"\tPrefix: {self.prefix}")
         s3_client = boto3.client(
             "s3",
             aws_access_key_id=AWS_ACCESS_KEY,
@@ -118,40 +121,9 @@ class S3ColorizationDataset(IterableDataset):
                 key = obj["Key"]
                 if key.lower().endswith((".jpg", ".jpeg", ".png")):
                     keys.append(key)
-        # print(f"\tTotal image keys found: {len(keys)}")
         return keys
 
-    def _reader_to_sample(self, reader_or_key):
-        """Convert S3 reader/key to (L, ab) sample."""
-        if hasattr(reader_or_key, "read"):
-            # s3torchconnector S3Reader
-            buffer = reader_or_key.read()
-        else:
-            # boto3 key string - CREATE NEW CLIENT HERE (per sample, picklable)
-            s3_client = boto3.client(
-                "s3",
-                aws_access_key_id=AWS_ACCESS_KEY,
-                aws_secret_access_key=AWS_SECRET_KEY,
-                endpoint_url=self.endpoint,
-                region_name=self.region,
-            )
-            buffer = s3_client.get_object(
-                Bucket=self.bucket, Key=reader_or_key
-            )["Body"].read()
-            # print(f"Read {len(buffer)} bytes from S3 for key: {reader_or_key}")
 
-        img = Image.open(io.BytesIO(buffer)).convert("RGB")
-        img = self.resize(img)
-        img_np = np.asarray(img) / 255.0
-
-        lab = rgb2lab(img_np).astype("float32")
-        L = lab[..., 0] / 100.0
-        ab = lab[..., 1:] / 128.0
-
-        L_tensor = torch.from_numpy(L).unsqueeze(0)
-        ab_tensor = torch.from_numpy(np.transpose(ab, (2, 0, 1)))
-
-        return L_tensor, ab_tensor
 
     def __iter__(self):
         if self.use_s3torchconnector:
@@ -159,14 +131,17 @@ class S3ColorizationDataset(IterableDataset):
             for reader in self.dataset:
                 try:
                     yield self._reader_to_sample(reader)
-                except Exception:
+                except Exception as e:
+                    # Log instead of silently dropping — was hiding the CUDA-in-worker bug.
+                    print(f"[S3ColorizationDataset] dropped sample: {type(e).__name__}: {e}")
                     continue
         else:
             # boto3 fallback
             for key in self.keys:
                 try:
                     yield self._reader_to_sample(key)
-                except Exception:
+                except Exception as e:
+                    print(f"[S3ColorizationDataset] dropped sample {key!r}: {type(e).__name__}: {e}")
                     continue
 
     def __len__(self):
@@ -215,3 +190,72 @@ class S3ColorizationDataset(IterableDataset):
         # If 'Contents' is in the response, it means at least one object exists
         # within that prefix, so the 'folder' exists.
         return train_exists and val_exists
+
+
+    def _reader_to_sample(self, reader_or_key):
+        """
+        Read one S3 object → RGB tensor → LAB → (L, ab).
+
+        CPU-only. DataLoader workers cannot safely use CUDA (fork-vs-CUDA issue),
+        and we'd have to copy back to CPU anyway for the collate step. The main
+        training loop moves batches to GPU via .to(device).
+        """
+        # --- 1) Read bytes from S3 or s3torchconnector ---
+        if hasattr(reader_or_key, "read"):
+            buffer = reader_or_key.read()
+        else:
+            s3_client = getattr(self, "_s3_client", None)
+            if s3_client is None:
+                s3_client = boto3.client(
+                    "s3",
+                    aws_access_key_id=AWS_ACCESS_KEY,
+                    aws_secret_access_key=AWS_SECRET_KEY,
+                    endpoint_url=self.endpoint,
+                    region_name=self.region,
+                )
+                self._s3_client = s3_client
+            buffer = s3_client.get_object(
+                Bucket=self.bucket, Key=reader_or_key
+            )["Body"].read()
+
+        # --- 2) Decode JPEG/PNG → tensor (C,H,W), uint8 ---
+        byte_tensor = torch.as_tensor(memoryview(buffer), dtype=torch.uint8).clone()
+        img_tensor = decode_image(byte_tensor)
+
+        # Normalize to [0,1]
+        img_tensor = img_tensor.float() / 255.0  # (C,H,W)
+
+        # --- 3) CPU preprocessing (always) ---
+        # Ensure 3 channels (grayscale → fake RGB by repeating)
+        if img_tensor.shape[0] == 1:
+            img_tensor = img_tensor.repeat(3, 1, 1)
+        elif img_tensor.shape[0] == 4:
+            # Drop alpha if present (RGBA → RGB)
+            img_tensor = img_tensor[:3]
+
+        # Resize on CPU
+        img_tensor = F.interpolate(
+            img_tensor.unsqueeze(0),
+            size=(self.image_size, self.image_size),
+            mode="bilinear",
+            align_corners=False,
+        )[0]                                          # (3,H',W')
+
+        # kornia rgb_to_lab runs on whatever device the tensor is on — here, CPU.
+        lab_tensor = rgb_to_lab(img_tensor.unsqueeze(0))[0]  # (3,H',W')
+        L  = lab_tensor[0:1] / 100.0
+        ab = lab_tensor[1:]  / 128.0
+
+        if not hasattr(self, "_debug_done"):
+            print("=== _reader_to_sample DEBUG ===")
+            print("  use_s3torchconnector:", self.use_s3torchconnector)
+            print("  CUDA available:", torch.cuda.is_available(), "(not used in workers)")
+            print("  L shape:", L.shape, "ab shape:", ab.shape)
+            print("  L dtype:", L.dtype, "ab dtype:", ab.dtype)
+            print("  L min/max:", float(L.min()), float(L.max()))
+            print("  ab min/max:", float(ab.min()), float(ab.max()))
+            print("  any NaN in L:", torch.isnan(L).any().item(),
+                  "any NaN in ab:", torch.isnan(ab).any().item())
+            self._debug_done = True
+
+        return L, ab

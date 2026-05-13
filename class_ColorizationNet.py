@@ -30,6 +30,7 @@ class ColorizationNet(nn.Module):
         # self.encoder = nn.Sequential(*list(resnet.children())[:-2])
 
         resnet = models.resnet18(weights="IMAGENET1K_V1")
+        # resnet = models.resnet18()
         self.encoder = nn.Sequential(*list(resnet.children())[:-2])
 
         

@@ -13,6 +13,7 @@ def build_train_val_s3_loaders(
     num_workers=0,
     val_fraction=0.1,
     use_s3torchconnector=True,
+    use_persistent_workers=False,
 ):
     """
     Builds train/val loaders from S3 prefix.
@@ -92,7 +93,7 @@ def build_train_val_s3_loaders(
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        # persistent_workers=num_workers > 0,  # Keep workers alive across epochs for IterableDataset        
+        persistent_workers=use_persistent_workers,  # Keep workers alive across epochs for IterableDataset        
     )
     print(f"Built train loader with {len(train_loader)} batches.")
     val_loader = DataLoader(
@@ -100,7 +101,7 @@ def build_train_val_s3_loaders(
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        # persistent_workers=num_workers > 0,  # Keep workers alive across epochs for IterableDataset
+        persistent_workers=use_persistent_workers,  # Keep workers alive across epochs for IterableDataset
     )
     print(f"Built val loader with {len(val_loader)} batches.")
     return train_loader, val_loader

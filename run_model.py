@@ -135,9 +135,9 @@ if __name__ == "__main__":
     # TODO: if you have a trained checkpoint, load it here:
 
     # ckpt_path = "checkpoints_local\\Landscape Dataset 90K_colorization_step_1000.pt"  # pick latest/best
-    ckpt_path = "checkpoints_s3\\Landscape Dataset 90K_best.pt"  # pick latest/best
-    checkpoint = torch.load(ckpt_path, map_location="cpu")
-    model.load_state_dict(checkpoint["model_state"])
+    # ckpt_path = "checkpoints_s3\\Landscape Dataset 90K_best.pt"  # pick latest/best
+    # checkpoint = torch.load(ckpt_path, map_location="cpu")
+    # model.load_state_dict(checkpoint["model_state"])
 
 
     # Path to input grayscale image (can also be color; we only use its L channel)
