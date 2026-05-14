@@ -60,7 +60,7 @@ def build_train_val_s3_loaders(
             s3_prefix += "/"  # Ensure prefix ends with slash for correct key construction
 
         all_keys = [f"{s3_prefix}{key}" for key in all_keys]  # Prepend prefix to keys
-        random.shuffle(all_keys)  # Shuffle keys to randomize train/val split
+        random.Random(42).shuffle(all_keys) # Shuffle keys to randomize train/val split; set seed for reproducibility
         # Split into two lists based on val_fraction (default 0.1 means 10% val, 90% train)
         split_point = int(len(all_keys) * (1 - val_fraction))
         train_set_uris = all_keys[:split_point]
@@ -95,6 +95,7 @@ def build_train_val_s3_loaders(
         pin_memory=pin_memory,
         persistent_workers=use_persistent_workers,  # Keep workers alive across epochs for IterableDataset        
     )
+
     print(f"Built train loader with {len(train_loader)} batches.")
     val_loader = DataLoader(
         val_dataset,
@@ -103,5 +104,7 @@ def build_train_val_s3_loaders(
         pin_memory=pin_memory,
         persistent_workers=use_persistent_workers,  # Keep workers alive across epochs for IterableDataset
     )
+
     print(f"Built val loader with {len(val_loader)} batches.")
+
     return train_loader, val_loader

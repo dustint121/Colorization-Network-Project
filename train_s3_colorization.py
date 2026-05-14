@@ -8,6 +8,7 @@ from torch.optim import Adam
 from tqdm.auto import tqdm
 
 from class_ColorizationNet import ColorizationNet
+from class_VGGPerceptualLoss import VGGPerceptualLoss, lab_to_rgb_torch
 from build_loader_s3 import build_train_val_s3_loaders
 
 import dotenv
@@ -43,6 +44,8 @@ def train_s3(
 
     model = ColorizationNet().to(device)
     criterion = nn.L1Loss()
+    perceptual = VGGPerceptualLoss(device=device).to(device)   
+    perceptual_weight = 0.5                                    
     optimizer = Adam(model.parameters(), lr=lr)
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -62,8 +65,8 @@ def train_s3(
         model.train()
         train_epoch_bar = tqdm(train_loader, desc=f"Training Epoch {epoch+1}", unit="batch")
         for L_batch, ab_batch in train_epoch_bar:
-            L_batch = L_batch.to(device).float()
-            ab_batch = ab_batch.to(device).float()
+            L_batch = L_batch.to(device, non_blocking=True).float()
+            ab_batch = ab_batch.to(device, non_blocking=True).float()
 
             optimizer.zero_grad()
 
@@ -72,7 +75,15 @@ def train_s3(
                                     dtype=torch.float16 if device == "cuda" else torch.float32,
                                     enabled=(device == "cuda")):
                 ab_pred = model(L_batch)
-                loss = criterion(ab_pred, ab_batch)
+                l1_loss = criterion(ab_pred, ab_batch)
+
+                # Reconstruct RGB for both predicted and ground-truth colorizations,
+                # then compare in VGG feature space.
+                pred_rgb   = lab_to_rgb_torch(L_batch, ab_pred)
+                target_rgb = lab_to_rgb_torch(L_batch, ab_batch)
+                perc_loss  = perceptual(pred_rgb, target_rgb)
+
+                loss = l1_loss + perceptual_weight * perc_loss
 
             # ---- BACKWARD WITH SCALER ----
             scaler.scale(loss).backward()
@@ -87,25 +98,45 @@ def train_s3(
 
             global_step += 1
             loss_value = loss.item()
-            train_epoch_bar.set_postfix({"loss": f"{loss_value:.4f}", "step": global_step})
-
+            train_epoch_bar.set_postfix({
+                                            "l1": f"{l1_loss.item():.4f}",
+                                            "perc": f"{perc_loss.item():.4f}",
+                                            "total": f"{loss.item():.4f}",
+                                            "step": global_step,
+                                        })
         train_epoch_bar.close()
 
         # ----- VALIDATION AFTER EPOCH -----
         print(f"Epoch {epoch+1} completed. Starting validation...")
-        val_epoch_bar = tqdm(val_loader, desc=f"Validation Epoch {epoch+1}", unit="batch")
+        val_epoch_bar = tqdm(val_loader, desc=f"Validation Epoch {epoch+1}")
         model.eval()
         val_loss_sum = 0.0
-        val_count = 0 
+        val_l1_sum = 0.0
+        val_perc_sum = 0.0
+        val_count = 0
         with torch.no_grad():
             for L_val, ab_val in val_epoch_bar:
-                L_val = L_val.to(device).float()
-                ab_val = ab_val.to(device).float()
+                L_val  = L_val.to(device, non_blocking=True).float()
+                ab_val = ab_val.to(device, non_blocking=True).float()
                 ab_pred_val = model(L_val)
-                loss_val = criterion(ab_pred_val, ab_val)
+
+                l1_v   = criterion(ab_pred_val, ab_val)
+                pred_rgb_v   = lab_to_rgb_torch(L_val, ab_pred_val)
+                target_rgb_v = lab_to_rgb_torch(L_val, ab_val)
+                perc_v = perceptual(pred_rgb_v, target_rgb_v)
+                loss_val = l1_v + perceptual_weight * perc_v
+
                 val_loss_sum += loss_val.item() * L_val.size(0)
+                val_l1_sum   += l1_v.item()   * L_val.size(0)
+                val_perc_sum += perc_v.item() * L_val.size(0)
                 val_count += L_val.size(0)
             val_epoch_bar.close()
+        mean_val_l1   = val_l1_sum   / val_count
+        mean_val_perc = val_perc_sum / val_count
+        mean_val_loss = mean_val_l1 + perceptual_weight * mean_val_perc
+        print(f"Epoch {epoch+1}: val_loss = {mean_val_loss:.4f} "
+              f"(l1={mean_val_l1:.4f}, perc={mean_val_perc:.4f}, over {val_count} samples)")
+
 
         # Guard against the "validated on 0 samples" footgun.
         if val_count == 0:
@@ -124,17 +155,17 @@ def train_s3(
         bucket_name = s3_prefix[5:].split("/")[0]  # Extract bucket name from s3://bucket/prefix
         epoch_ckpt_name = f"{bucket_name}_colorization_epoch_{epoch+1}.pt"
         epoch_ckpt_path = os.path.join(checkpoint_dir, epoch_ckpt_name)
-        torch.save(
-            {
-                "step": global_step,
-                "epoch": epoch,
-                "model_state": model.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "val_loss": mean_val_loss,
-            },
-            epoch_ckpt_path,
-        )
-        print(f"Saved end-of-epoch checkpoint to {epoch_ckpt_path}")
+        # torch.save(
+        #     {
+        #         "step": global_step,
+        #         "epoch": epoch,
+        #         "model_state": model.state_dict(),
+        #         "optimizer_state": optimizer.state_dict(),
+        #         "val_loss": mean_val_loss,
+        #     },
+        #     epoch_ckpt_path,
+        # )
+        # print(f"Saved end-of-epoch checkpoint to {epoch_ckpt_path}")
 
         # ----- BEST CHECKPOINT -----
         if mean_val_loss < best_val_loss:
