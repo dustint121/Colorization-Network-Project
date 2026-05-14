@@ -106,7 +106,22 @@ class S3ColorizationDataset(IterableDataset):
         # print(f"Found {len(self.keys)} image keys in S3 with bucket: {self.bucket} and prefix: {self.prefix}")
 
     def _list_s3_keys(self):
-        """List all image files under S3 prefix."""
+        """List all image files under S3 prefix, with on-disk cache."""
+        import pickle, hashlib
+
+        # Unique cache file per (bucket, prefix) combo
+        cache_key = hashlib.md5(f"{self.bucket}/{self.prefix}".encode()).hexdigest()[:12]
+        cache_path = f"/content/s3_keys_cache_{cache_key}.pkl"
+        if not os.path.exists("/content"):
+            cache_path = f"./s3_keys_cache_{cache_key}.pkl"
+
+        if os.path.exists(cache_path):
+            with open(cache_path, "rb") as f:
+                keys = pickle.load(f)
+            print(f"\tLoaded {len(keys)} keys from cache: {cache_path}")
+            return keys
+
+        print(f"\tListing S3 keys (no cache found)...")
         s3_client = boto3.client(
             "s3",
             aws_access_key_id=AWS_ACCESS_KEY,
@@ -121,6 +136,10 @@ class S3ColorizationDataset(IterableDataset):
                 key = obj["Key"]
                 if key.lower().endswith((".jpg", ".jpeg", ".png")):
                     keys.append(key)
+
+        with open(cache_path, "wb") as f:
+            pickle.dump(keys, f)
+        print(f"\tCached {len(keys)} keys to: {cache_path}")
         return keys
 
 
