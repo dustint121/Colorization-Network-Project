@@ -110,7 +110,8 @@ class S3ColorizationDataset(IterableDataset):
         import pickle, hashlib
 
         # Unique cache file per (bucket, prefix) combo
-        cache_key = hashlib.md5(f"{self.bucket}/{self.prefix}".encode()).hexdigest()[:12]
+        # cache_key = hashlib.md5(f"{self.bucket}/{self.prefix}".encode()).hexdigest()[:12]
+        cache_key = f"{self.bucket}_{self.prefix}".replace("/", "_")[:50]  # simpler cache key
         cache_path = f"/content/s3_keys_cache_{cache_key}.pkl"
         if not os.path.exists("/content"):
             cache_path = f"./s3_keys_cache_{cache_key}.pkl"

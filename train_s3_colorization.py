@@ -8,6 +8,7 @@ from torch.optim import Adam
 from tqdm.auto import tqdm
 
 from class_ColorizationNet import ColorizationNet
+from class_ColorizationUNet import ColorizationUNet
 from class_VGGPerceptualLoss import VGGPerceptualLoss, lab_to_rgb_torch
 from build_loader_s3 import build_train_val_s3_loaders
 
@@ -42,11 +43,24 @@ def train_s3(
         use_persistent_workers=use_persistent_workers,
     )
 
-    model = ColorizationNet().to(device)
+    # model = ColorizationNet().to(device)
+    model = ColorizationUNet(pretrained=True, freeze_encoder_epochs=3).to(device)
     criterion = nn.L1Loss()
     perceptual = VGGPerceptualLoss(device=device).to(device)   
     perceptual_weight = 0.5                                    
-    optimizer = Adam(model.parameters(), lr=lr)
+    # optimizer = Adam(model.parameters(), lr=lr)
+    # Set up separate parameter groups for encoder and decoder with different learning rates.
+    encoder_params = []
+    decoder_params = []
+    for name, p in model.named_parameters():
+        if name.startswith(("stem_", "layer1", "layer2", "layer3", "layer4")):
+            encoder_params.append(p)
+        else:
+            decoder_params.append(p)
+    optimizer = torch.optim.Adam([
+        {"params": encoder_params, "lr": 1e-5},   # 10x lower
+        {"params": decoder_params, "lr": 1e-4},
+    ])
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", patience=3, factor=0.5
@@ -57,7 +71,16 @@ def train_s3(
     best_val_loss = float("inf")
     global_step = 0
 
+
+    # Freeze for epoch 0, 1, 2; unfreeze at epoch 3
+    WARMUP_EPOCHS = 3
     for epoch in range(num_epochs):
+        if epoch < WARMUP_EPOCHS:
+            model.set_encoder_trainable(False)
+            print(f"Epoch {epoch}: encoder frozen")
+        elif epoch == WARMUP_EPOCHS:
+            model.set_encoder_trainable(True)
+            print(f"Epoch {epoch}: encoder unfrozen")
         # reset global step here; stream iterator messes up calculations
         global_step = epoch * len(train_loader)
         
