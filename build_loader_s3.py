@@ -31,29 +31,40 @@ def build_train_val_s3_loaders(
     # total_images = len(all_keys)
     # print(f"Total images found in S3: {total_images}")
     # print(all_keys[:5])  # Print first 5 keys for verification
+    train_split_keys, val_split_keys = S3ColorizationDataset._find_train_val_split_from_keys(all_keys)
+    print(f"Split discovery: {len(train_split_keys)} train keys, {len(val_split_keys)} val keys")
+    if train_split_keys:
+        print(f"  sample train key: {train_split_keys[0]}")
+    if val_split_keys:
+        print(f"  sample val key:   {val_split_keys[0]}")
 
-    train_val_folder_check = full_dataset.s3_train_val_folders_exists(bucket_name=s3_prefix)
-
+    train_val_folder_check = bool(train_split_keys) and bool(val_split_keys)
     train_dataset, val_dataset = None, None
+
     if train_val_folder_check:
-        # For simplicity with IterableDataset: use prefix split or manual sharding
-        # Option 1: separate S3 prefixes for train/val
+        # Feed the discovered keys straight to the child datasets so they
+        # don't re-list S3 under a wrong prefix. Bucket is taken from the
+        # parent s3_prefix; keys are already relative to the bucket root.
         train_dataset = S3ColorizationDataset(
-            s3_prefix_or_uris=f"{s3_prefix}/train/",
+            s3_prefix_or_uris=s3_prefix,
             region=region,
             endpoint=endpoint,
             image_size=image_size,
             use_s3torchconnector=use_s3torchconnector,
             split="train",
+            _keys_override=train_split_keys,
         )
         val_dataset = S3ColorizationDataset(
-            s3_prefix_or_uris=f"{s3_prefix}/val/",
+            s3_prefix_or_uris=s3_prefix,
             region=region,
             endpoint=endpoint,
             image_size=image_size,
             use_s3torchconnector=use_s3torchconnector,
             split="val",
+            _keys_override=val_split_keys,
         )
+        print(f"Built train dataset ({len(train_dataset)}) and val dataset ({len(val_dataset)}) from discovered split.")
+
     else:
         print("No 'train'/'val' folders found in S3. Using single dataset and splitting by first N% of keys for val.")
         if s3_prefix.endswith("/") != True:
@@ -106,5 +117,22 @@ def build_train_val_s3_loaders(
     )
 
     print(f"Built val loader with {len(val_loader)} batches.")
+
+
+    # Fail fast rather than silently running empty epochs (was: 16 epochs of
+    # val_loss=inf before the user hit Ctrl-C).
+    n_train_batches = len(train_loader)
+    n_val_batches   = len(val_loader)
+    print(f"Built train loader with {n_train_batches} batches ({len(train_dataset)} samples).")
+    print(f"Built val   loader with {n_val_batches} batches ({len(val_dataset)} samples).")
+
+    if n_train_batches == 0 or n_val_batches == 0:
+        raise RuntimeError(
+            f"Empty DataLoader detected (train batches={n_train_batches}, "
+            f"val batches={n_val_batches}). This usually means S3 key discovery "
+            f"picked up 0 images. Check the 'Split discovery' log above and "
+            f"verify that s3_prefix ({s3_prefix!r}) actually contains .jpg/.jpeg/.png "
+            f"objects with a 'train' or 'val' component in their key path."
+        )
 
     return train_loader, val_loader

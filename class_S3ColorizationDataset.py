@@ -5,9 +5,10 @@ import torch
 from torch.utils.data import IterableDataset
 from torchvision import transforms
 import torch.nn.functional as F
-from torchvision.io import decode_image
-from kornia.color import rgb_to_lab
-
+import numpy as np
+from PIL import Image
+from skimage.color import rgb2lab
+from botocore.config import Config
 import dotenv
 dotenv.load_dotenv()
 
@@ -44,6 +45,7 @@ class S3ColorizationDataset(IterableDataset):
         split="train",  # "train" or "val"
         val_fraction=0.1,
         use_s3torchconnector=True,
+        _keys_override=None,
     ):
         super().__init__()
         self.image_size = image_size
@@ -52,6 +54,12 @@ class S3ColorizationDataset(IterableDataset):
         self.split = split
         self.resize = transforms.Resize((image_size, image_size))
         self.num_files = None
+        self._keys_override = _keys_override
+
+        # NOTE: removed self.resize_gpu — used to be an nn.Upsample(...).cuda()
+        # module here, but it (a) crashed CPU-only runtimes and (b) tried to
+        # do GPU work inside DataLoader workers, which is what was causing
+        # val_loss = 0 (all val samples were silently dropped).
 
         # Windows check: s3torchconnector doesn't work on Windows
         self.use_s3torchconnector = use_s3torchconnector and S3_AVAILABLE and os.name != "nt"
@@ -73,7 +81,19 @@ class S3ColorizationDataset(IterableDataset):
                 endpoint=self.endpoint,
                 enable_sharding=True  # Enable sharding for distributed training
             )
-            self.num_files = len(self._list_s3_keys())
+            if self._keys_override is not None:
+                # Skip the second boto3 list_objects_v2 pass — parent already listed.
+                self.num_files = len(self._keys_override)
+                self.keys = self._keys_override  # for __len__ + diagnostics
+                # Rebuild the s3torchconnector dataset from explicit URIs so it only
+                # streams these keys (from_prefix would still walk the whole prefix).
+                uris = [f"s3://{self.bucket}/{k}" for k in self._keys_override]
+                self.dataset = s3tc.S3IterableDataset.from_objects(
+                    uris, region=self.region, endpoint=self.endpoint,
+                    enable_sharding=True,
+                )
+            else:
+                self.num_files = len(self._list_s3_keys())
         else:
             self.dataset = s3tc.S3IterableDataset.from_objects(
                 prefix_or_uris,
@@ -109,9 +129,7 @@ class S3ColorizationDataset(IterableDataset):
         """List all image files under S3 prefix, with on-disk cache."""
         import pickle, hashlib
 
-        # Unique cache file per (bucket, prefix) combo
-        # cache_key = hashlib.md5(f"{self.bucket}/{self.prefix}".encode()).hexdigest()[:12]
-        cache_key = f"{self.bucket}_{self.prefix}".replace("/", "_")[:50]  # simpler cache key
+        cache_key = f"{self.bucket}_{self.prefix}".replace("/", "_")[:50]  
         cache_path = f"/content/s3_keys_cache_{cache_key}.pkl"
         if not os.path.exists("/content"):
             cache_path = f"./s3_keys_cache_{cache_key}.pkl"
@@ -170,7 +188,33 @@ class S3ColorizationDataset(IterableDataset):
         else:
             return len(self.keys)
 
+    @staticmethod
+    def _find_train_val_split_from_keys(all_keys):
+        """
+        Given the full list of S3 keys under the bucket, partition them into
+        (train_keys, val_keys) by looking for a path component literally named
+        'train' or 'val' anywhere in each key.
 
+        This handles all real ImageNet-on-S3 layouts:
+          - train/n01440764/foo.JPEG
+          - ILSVRC/Data/CLS-LOC/train/n01440764/foo.JPEG
+          - imagenet/train/foo.jpg
+          - anything/nested/deeper/val/foo.png
+
+        A key is classified as val iff any of its '/'-delimited parts is exactly
+        'val' (or 'valid' / 'validation'); as train iff any part is exactly
+        'train'; otherwise it is dropped from the split (belongs to neither).
+        """
+        train_keys, val_keys = [], []
+        VAL_PARTS   = {"val", "valid", "validation"}
+        TRAIN_PARTS = {"train", "training"}
+        for k in all_keys:
+            parts = set(k.split("/"))
+            if parts & VAL_PARTS:
+                val_keys.append(k)
+            elif parts & TRAIN_PARTS:
+                train_keys.append(k)
+        return train_keys, val_keys
 
 
     def s3_train_val_folders_exists(self, bucket_name):
@@ -214,11 +258,8 @@ class S3ColorizationDataset(IterableDataset):
 
     def _reader_to_sample(self, reader_or_key):
         """
-        Read one S3 object → RGB tensor → LAB → (L, ab).
-
-        CPU-only. DataLoader workers cannot safely use CUDA (fork-vs-CUDA issue),
-        and we'd have to copy back to CPU anyway for the collate step. The main
-        training loop moves batches to GPU via .to(device).
+        Read one S3 object → RGB → LAB → (L, ab).
+        Optimized CPU pipeline: Pillow draft-decode + skimage LAB.
         """
         # --- 1) Read bytes from S3 or s3torchconnector ---
         if hasattr(reader_or_key, "read"):
@@ -227,55 +268,38 @@ class S3ColorizationDataset(IterableDataset):
             s3_client = getattr(self, "_s3_client", None)
             if s3_client is None:
                 s3_client = boto3.client(
-                    "s3",
-                    aws_access_key_id=AWS_ACCESS_KEY,
-                    aws_secret_access_key=AWS_SECRET_KEY,
-                    endpoint_url=self.endpoint,
-                    region_name=self.region,
-                )
+                                        "s3",
+                                        aws_access_key_id=AWS_ACCESS_KEY,
+                                        aws_secret_access_key=AWS_SECRET_KEY,
+                                        endpoint_url=self.endpoint,
+                                        region_name=self.region,
+                                        config=Config(
+                                            max_pool_connections=256,
+                                            retries={"max_attempts": 3, "mode": "adaptive"},
+                                            tcp_keepalive=True,
+                                        ),
+                                    )
                 self._s3_client = s3_client
             buffer = s3_client.get_object(
                 Bucket=self.bucket, Key=reader_or_key
             )["Body"].read()
 
-        # --- 2) Decode JPEG/PNG → tensor (C,H,W), uint8 ---
-        byte_tensor = torch.as_tensor(memoryview(buffer), dtype=torch.uint8).clone()
-        img_tensor = decode_image(byte_tensor)
+        # --- 2) Decode at REDUCED resolution (3-5x faster than full decode) ---
+        img = Image.open(io.BytesIO(buffer))
+        img.draft("RGB", (self.image_size, self.image_size))  # libjpeg fast path
+        img = img.convert("RGB").resize(
+            (self.image_size, self.image_size), Image.BILINEAR
+        )
 
-        # Normalize to [0,1]
-        img_tensor = img_tensor.float() / 255.0  # (C,H,W)
+        # --- 3) To numpy float32, normalized [0,1] ---
+        img_np = np.asarray(img, dtype=np.float32) / 255.0  # (H, W, 3)
 
-        # --- 3) CPU preprocessing (always) ---
-        # Ensure 3 channels (grayscale → fake RGB by repeating)
-        if img_tensor.shape[0] == 1:
-            img_tensor = img_tensor.repeat(3, 1, 1)
-        elif img_tensor.shape[0] == 4:
-            # Drop alpha if present (RGBA → RGB)
-            img_tensor = img_tensor[:3]
+        # --- 4) skimage LAB (much faster on CPU than kornia) ---
+        lab = rgb2lab(img_np).astype("float32")              # (H, W, 3)
+        L_np  = lab[..., 0:1] / 100.0                        # (H, W, 1)
+        ab_np = lab[..., 1:]  / 128.0                        # (H, W, 2)
 
-        # Resize on CPU
-        img_tensor = F.interpolate(
-            img_tensor.unsqueeze(0),
-            size=(self.image_size, self.image_size),
-            mode="bilinear",
-            align_corners=False,
-        )[0]                                          # (3,H',W')
-
-        # kornia rgb_to_lab runs on whatever device the tensor is on — here, CPU.
-        lab_tensor = rgb_to_lab(img_tensor.unsqueeze(0))[0]  # (3,H',W')
-        L  = lab_tensor[0:1] / 100.0
-        ab = lab_tensor[1:]  / 128.0
-
-        if not hasattr(self, "_debug_done"):
-            print("=== _reader_to_sample DEBUG ===")
-            print("  use_s3torchconnector:", self.use_s3torchconnector)
-            print("  CUDA available:", torch.cuda.is_available(), "(not used in workers)")
-            print("  L shape:", L.shape, "ab shape:", ab.shape)
-            print("  L dtype:", L.dtype, "ab dtype:", ab.dtype)
-            print("  L min/max:", float(L.min()), float(L.max()))
-            print("  ab min/max:", float(ab.min()), float(ab.max()))
-            print("  any NaN in L:", torch.isnan(L).any().item(),
-                  "any NaN in ab:", torch.isnan(ab).any().item())
-            self._debug_done = True
-
+        # --- 5) To torch tensors with PyTorch's (C, H, W) layout ---
+        L  = torch.from_numpy(L_np).permute(2, 0, 1).contiguous()   # (1, H, W)
+        ab = torch.from_numpy(ab_np).permute(2, 0, 1).contiguous()  # (2, H, W)
         return L, ab

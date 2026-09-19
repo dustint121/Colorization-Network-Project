@@ -43,11 +43,17 @@ def train_s3(
         use_persistent_workers=use_persistent_workers,
     )
 
+    if len(train_loader) == 0 or len(val_loader) == 0:
+        raise RuntimeError(
+            f"train_s3 refuses to run with empty loaders "
+            f"(train batches={len(train_loader)}, val batches={len(val_loader)})."
+        )
+
     # model = ColorizationNet().to(device)
     model = ColorizationUNet(pretrained=True, freeze_encoder_epochs=3).to(device)
     criterion = nn.L1Loss()
     perceptual = VGGPerceptualLoss(device=device).to(device)   
-    perceptual_weight = 0.5                                    
+    perceptual_weight = 0.3                                    
     # optimizer = Adam(model.parameters(), lr=lr)
     # Set up separate parameter groups for encoder and decoder with different learning rates.
     encoder_params = []
@@ -97,17 +103,21 @@ def train_s3(
             with autocast(device_type="cuda" if device == "cuda" else "cpu",
                                     dtype=torch.float16 if device == "cuda" else torch.float32,
                                     enabled=(device == "cuda")):
-                ab_pred = model(L_batch)
-                l1_loss = criterion(ab_pred, ab_batch)
+                ab_pred_f32 = model(L_batch)
+                l1_loss = criterion(ab_pred_f32, ab_batch)
 
+            if perceptual_weight > 0:
                 # Reconstruct RGB for both predicted and ground-truth colorizations,
                 # then compare in VGG feature space.
-                pred_rgb   = lab_to_rgb_torch(L_batch, ab_pred)
+                pred_rgb   = lab_to_rgb_torch(L_batch, ab_pred_f32)
                 target_rgb = lab_to_rgb_torch(L_batch, ab_batch)
                 perc_loss  = perceptual(pred_rgb, target_rgb)
-
                 loss = l1_loss + perceptual_weight * perc_loss
-
+            else:
+                # keep perc_loss as a tensor for logging without any graph
+                perc_loss = torch.tensor(0.0, device=device)
+                loss = l1_loss
+                
             # ---- BACKWARD WITH SCALER ----
             scaler.scale(loss).backward()
 
@@ -121,6 +131,28 @@ def train_s3(
 
             global_step += 1
             loss_value = loss.item()
+
+            # ---- CHROMA DIAGNOSTIC ----
+            # For a memorization test, the key question is whether the model
+            # is confidently predicting saturated colors or shrinking toward
+            # gray (the "mean brown" failure mode of L1 regression on ab).
+            # If ab_pred.abs().mean() lags ab_batch.abs().mean() by more
+            # than ~30% at plateau, the model is undershooting chroma.
+            # if global_step % 50 == 0:
+            #     with torch.no_grad():
+            #         pred_abs_mean = ab_pred_f32.abs().mean().item()
+            #         tgt_abs_mean  = ab_batch.abs().mean().item()
+            #         pred_max      = ab_pred_f32.abs().max().item()
+            #         tgt_max       = ab_batch.abs().max().item()
+            #         print(
+            #             f"[chroma] step={global_step} "
+            #             f"pred_abs_mean={pred_abs_mean:.3f} "
+            #             f"tgt_abs_mean={tgt_abs_mean:.3f} "
+            #             f"pred_max={pred_max:.3f} "
+            #             f"tgt_max={tgt_max:.3f} "
+            #             f"ratio={pred_abs_mean/max(tgt_abs_mean,1e-8):.2f}"
+            #         )
+
             train_epoch_bar.set_postfix({
                                             "l1": f"{l1_loss.item():.4f}",
                                             "perc": f"{perc_loss.item():.4f}",
@@ -141,43 +173,54 @@ def train_s3(
             for L_val, ab_val in val_epoch_bar:
                 L_val  = L_val.to(device, non_blocking=True).float()
                 ab_val = ab_val.to(device, non_blocking=True).float()
-                ab_pred_val = model(L_val)
+                ab_pred_val = model(L_val).float()
 
                 l1_v   = criterion(ab_pred_val, ab_val)
-                pred_rgb_v   = lab_to_rgb_torch(L_val, ab_pred_val)
-                target_rgb_v = lab_to_rgb_torch(L_val, ab_val)
-                perc_v = perceptual(pred_rgb_v, target_rgb_v)
-                loss_val = l1_v + perceptual_weight * perc_v
+                # Guard perceptual on the val path too, matching train.
+                if perceptual_weight > 0:
+                    pred_rgb_v   = lab_to_rgb_torch(L_val, ab_pred_val)
+                    target_rgb_v = lab_to_rgb_torch(L_val, ab_val)
+                    perc_v = perceptual(pred_rgb_v, target_rgb_v)
+                    loss_val = l1_v + perceptual_weight * perc_v
+                else:
+                    perc_v = torch.tensor(0.0, device=device)
+                    loss_val = l1_v
 
                 val_loss_sum += loss_val.item() * L_val.size(0)
-                val_l1_sum   += l1_v.item()   * L_val.size(0)
-                val_perc_sum += perc_v.item() * L_val.size(0)
+                val_l1_sum   += l1_v.item()    * L_val.size(0)
+                val_perc_sum += perc_v.item()  * L_val.size(0)
                 val_count += L_val.size(0)
             val_epoch_bar.close()
-        mean_val_l1   = val_l1_sum   / val_count
-        mean_val_perc = val_perc_sum / val_count
-        mean_val_loss = mean_val_l1 + perceptual_weight * mean_val_perc
-        print(f"Epoch {epoch+1}: val_loss = {mean_val_loss:.4f} "
-              f"(l1={mean_val_l1:.4f}, perc={mean_val_perc:.4f}, over {val_count} samples)")
 
 
-        # Guard against the "validated on 0 samples" footgun.
+        # ---- SINGLE, UNAMBIGUOUS VAL_LOSS COMPUTATION ----
         if val_count == 0:
-            print(f"WARNING: Epoch {epoch+1} validated on 0 samples — "
-                  f"check that workers are yielding data (look for "
-                  f"'[S3ColorizationDataset] dropped sample' messages above).")
-            mean_val_loss = float("inf")
+            # Escalate: 0 val samples means either every val worker crashed
+            # silently or the val loader has 0 batches. Either way, further
+            # epochs cannot recover — stop instead of grinding through more.
+            raise RuntimeError(
+                f"Epoch {epoch+1} validated on 0 samples — check for "
+                f"'[S3ColorizationDataset] dropped sample' messages above, "
+                f"or empty val loader (which build_train_val_s3_loaders "
+                f"should have already caught)."
+            )
         else:
-            mean_val_loss = val_loss_sum / val_count
-        print(f"Epoch {epoch+1}: val_loss = {mean_val_loss:.4f} (over {val_count} samples)")
+            mean_val_l1   = val_l1_sum   / val_count
+            mean_val_perc = val_perc_sum / val_count
+            mean_val_loss = mean_val_l1 + perceptual_weight * mean_val_perc
 
+        print(
+            f"Epoch {epoch+1}: val_loss = {mean_val_loss:.4f} "
+            f"(l1={mean_val_l1:.4f}, perc={mean_val_perc:.4f}, "
+            f"over {val_count} samples)"
+        )
 
         scheduler.step(mean_val_loss)
 
-        # ----- END-OF-EPOCH CHECKPOINT (new) -----
-        bucket_name = s3_prefix[5:].split("/")[0]  # Extract bucket name from s3://bucket/prefix
-        epoch_ckpt_name = f"{bucket_name}_colorization_epoch_{epoch+1}.pt"
-        epoch_ckpt_path = os.path.join(checkpoint_dir, epoch_ckpt_name)
+        # ----- END-OF-EPOCH CHECKPOINT -----
+        # bucket_name = s3_prefix[5:].split("/")[0]  # Extract bucket name from s3://bucket/prefix
+        # epoch_ckpt_name = f"{bucket_name}_colorization_epoch_{epoch+1}.pt"
+        # epoch_ckpt_path = os.path.join(checkpoint_dir, epoch_ckpt_name)
         # torch.save(
         #     {
         #         "step": global_step,
@@ -193,7 +236,7 @@ def train_s3(
         # ----- BEST CHECKPOINT -----
         if mean_val_loss < best_val_loss:
             best_val_loss = mean_val_loss
-            bucket_name = s3_prefix[5:].split("/")[0]  # Extract bucket name from s3://bucket/prefix
+            bucket_name = s3_prefix[5:].split("/")[0]
             best_path = os.path.join(checkpoint_dir, f"{bucket_name}_colorization_best.pt")
             torch.save(
                 {
@@ -208,7 +251,6 @@ def train_s3(
             print(
                 f"New best checkpoint (val_loss={best_val_loss:.4f}) saved to {best_path}"
             )
-
 
 
 if __name__ == "__main__":
