@@ -199,9 +199,10 @@ if __name__ == "__main__":
 
     # ckpt_path = "checkpoints_local\\landscape-images_colorization_best.pt"
     # ckpt_path = "checkpoints_local\\imdb-images_colorization_best.pt"
-    ckpt_path = "checkpoints_local\\same-image_colorization_best.pt"
+    # ckpt_path = "checkpoints_local\\same-image_colorization_best.pt"
     # ckpt_path = "checkpoints_local\\imagenet21k_a100_highram_best_old.pt"
-
+    # ckpt_path = "checkpoints_local\\imagenet21k_a100_highram_best.pt"
+    ckpt_path = "checkpoints_local\\ilsvrc-image-net_colorization_best.pt"
 
     #get substring of ckpt_path between 'checkpoints_local\\' and '_best.pt'
     ckpt_name = ckpt_path.split("checkpoints_local\\")[1].split("_best.pt")[0]
@@ -211,7 +212,10 @@ if __name__ == "__main__":
 
     # Path to input grayscale image (can also be color; we only use its L channel)
     # input_path = "test_images/old lady.jpg"
-    # input_path = "test_images/0-modified.jpg"
+    # input_path = "test_images/lady.jpg"
+    # input_path = "test_images/michael-jordan.jpg"
+    # input_path = "test_images/president_obama.jpg"
+    # input_path = "test_images/test.jpg"
     # input_path = "test_images/group.jpg"
     # input_path = "test_images/landscape_bw.jpg"
     # input_path = "test_images/fantasy.jpg"

@@ -1,0 +1,58 @@
+﻿* Net vs UNet
+   * Please discuss difference
+
+
+* ResNet18 architecture and weights
+   * Using ResNet18 pretrained weights don’t work since weights were trained for a different purpose
+
+
+* Image size = 256
+   * Dimension at which Resnet-18 was trained
+   * Input images must be transformed into this dimension
+* Dataset used
+   * “Same Image Dataset” - 1000 of the same image of president obama
+   * “Landscape Dataset” - 90,000 images of landscapes Landscapes dataset (LHQ 1024×1024) 
+   * “IMDB” dataset - 300,000 images https://github.com/fwang91/IMDb-Face?tab=readme-ov-file#data-download 
+   * “ILSVLC” dataset - 500,000 images
+   * ImageNet-21K - 13.1 million images
+
+
+* L1 loss vs perceptual loss + L1 loss
+* Change in optimizers
+* Scheduler
+* Scaler
+* autocast
+
+
+* Frozen epochs
+   * Why should/should not have initial epochs frozen?
+* Time to First Byte (TTFB) issue
+   * Unviable to store/receive all 13 million images from ImageNet (latency bound)
+      * Switch to storing multiple batches of images into tar files
+
+
+
+
+* Learning rate: 1e-3 → 1e-4 → 1e-5 for ImageNet
+   * 1e-3 → 0.077 to 0.068 val_loss
+   * 1e-4 → 0.068 to 0.063
+   * 1e-5 → 0.063 to
+
+
+
+
+
+
+* Focus on budge → limited performance
+   * Wasabi vs AWS S3
+      * No cost for reading
+   * Google Collab Notebook
+      * A100 for primary training
+
+
+* Compute bound by network latency/travel
+* Higher num_workers -> higher system ram required
+   * For this project, why does a higher amount of workers beyond the cpu count to better time-wise? 
+* Higher batch_size -> higher gpu ram required
+   * For project, higher batch size does not improve time (bound by network/distance latency)
+   * Smaller batch size, all else being equal like time, is better for catching more noise per batch.
